@@ -1,56 +1,62 @@
-# Processing Pipeline
+# Core Components
 
-1. Step 1: URL Building
+1. `vad_lookup.py` - VAD Index Builder
 
-```
-pythonurls = build_urls(langs=["es", "ar", "fr"])
-```
+Input: `vad_results.jsonl` (contains VAD timestamps for all 2.1M audio files)
 
-Scans `lid_index.pkl` for tar files containing the difference language you want to retrieve. **Note: Each tar contains mixed languages, not just the target ones**
+Process:
 
-2. Step 2: WebDataset Creation
+* Parses JSONL line by line with progress bar
+* Extracts speech segments with start/end timestamps
+* Converts sample-based timestamps to seconds
+* Organizes by tar file for efficient lookup
+* Output: Sharded pickle files (000001.pkl, 000002.pkl, etc.)
+* Each shard contains: {filename: {"segments": [(start, end), ...], "duration": X}}
+* Memory Optimization: Flushes to disk every 10,000 lines to manage memory
 
-```
-pythonwds.WebDataset(urls, shardshuffle=1000)
-    .to_tuple("mp3", "__key__", "__url__")
-    .map(decode_and_normalize_with_vad)
-```
+2. `apply_vad.py` - VAD-Enhanced Audio Processor. Key Functions:`decode_and_normalize_with_vad()`
 
-Streams audio files from tar archives (no full download). `shardshuffle=1000` randomizes tar file order. Each file is decoded as`(mp3_bytes, filename, tar_url)`
+Process: 
 
-3. Step 3: VAD-Based Processing `(decode_and_normalize_with_vad)`
+* Parse URL: Extract tar number from URL pattern
+* Language Filter: Skip if language not in desired_languages
+* VAD Lookup: Load pre-processed speech segments for this tar file
+* Segment Selection: Find speech segments ≥10 seconds
+* Chunk Generation: Extract random 10-second chunks from valid segments
+* Batching: Stack chunks into tensor with attention masks
 
-**Language Filtering:**
+---
 
-```
-pythonlookup_key = (tar_number, filename)
-language = tar_to_lang.get(lookup_key, "unknown")
-if desired_languages and language not in desired_languages:
-    return None  # Skip non-target languages
-```
+**Performance Features:**
 
-**VAD Segment Loading:**
+* `@lru_cache(maxsize=16)`: Caches recently loaded VAD shards for speed
 
-```
-pythonvad_shard = load_vad_shard(tar_number)  # Loads cached pickle
-vad_data = vad_shard.get(filename)
-segments = vad_data.get('segments', [])  # [(start, end), ...]
-Chunk Extraction:
-python# Find all speech segments ≥10 seconds
-candidate_windows = []
-for seg_start, seg_end in segments:
-    if seg_end - seg_start >= chunk_sec:
-        candidate_windows.append((seg_start, seg_end - chunk_sec))
-```
+* Progressive Sampling: Extracts up to max_chunks_per_example from each file
 
-**Extract up to 16 random 10-second chunks**
-```
-for _ in range(num_chunks):
-    seg_start, max_start = random.choice(candidate_windows)
-    start_sec = random.uniform(seg_start, max_start)
-    end_sec = start_sec + chunk_sec
-    output_chunks.append(_stream_chunk(start_sec, end_sec))
-```
+* Efficient Decoding: Uses torchcodec.decoders.AudioDecoder with range extraction
+
+* `collate_fn()`
+    Purpose: Combines multiple samples into a training batch
+
+    Handles: Variable number of chunks per audio file
+
+    Output:
+
+    `input_values`: Concatenated audio tensors [total_chunks, 160000]
+
+    `attention_mask`: Ones tensor matching input shape
+
+    `language`: List of language codes for each chunk
+
+---
+
+**`vad_lookup.py` Helper Functions**
+
+* `_parse_speech_segments()` converts VAD timestamps from sample indices to seconds and filters invalid/missing timestamps. Returns None if no speech detected
+
+* `_flush_shards()` implements atomic write pattern with temp files. Merges new data with existing shards. Prevents data corruption during interrupted runs
+
+---
 
 **Skip Conditions:**
 
@@ -59,18 +65,23 @@ for _ in range(num_chunks):
 * No segments ≥10 seconds long
 * Language not in target list
 
-4. Step 4: Batch Collation `(collate_fn)`
-
-```
-input_values = torch.cat([sample["input_values"] for sample in batch], dim=0)
-```
-
-**Track language for each chunk**
-```
-languages = []
-for sample in batch:
-    num_chunks = sample["input_values"].shape[0]
-    languages.extend([sample["language"]] * num_chunks)
-```
-
+---
 **The usage example is `main_example.py`**
+
+```
+batch_size = 1  # Controls how many audio FILES are processed per batch
+```
+
+* Purpose: Determines how many audio files (from the WebDataset) are processed together in a single batch
+
+* Effect: Each audio file can produce multiple 10-second chunks (up to max_chunks_per_example in apply_vad.py)
+
+* Example: With batch_size=2 and max_chunks_per_example=3, you could get 2-6 chunks per batch (depending on available speech segments)
+
+```
+max_batches = 20  # Limits total number of batches returned
+```
+
+* Purpose: Safety limit to prevent infinite loops
+
+* Implementation: Breaks the loop after processing specified number of batches
